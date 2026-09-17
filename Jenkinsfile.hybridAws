@@ -1,0 +1,100 @@
+pipeline {
+    agent any
+
+    // Trigger pipeline otomatis hanya saat ada Git Tag baru yang dibuat (contoh: v1.0.0)
+    triggers {
+        githubPush() // atau dikontrol via webhook SCM dengan tag filter
+    }
+
+    environment {
+        AWS_REGION     = 'ap-southeast-1'
+        ECR_REGISTRY   = '123456789012.dkr.ecr.ap-southeast-1.amazonaws.com'
+        IMAGE_NAME     = 'mapid-retail-platform'
+        
+        // Memanggil Environment Variables sensitif dari Jenkins Credentials Binding
+        TELEGRAM_BOT_TOKEN = credentials('telegram-bot-token')
+        TELEGRAM_CHAT_ID   = credentials('telegram-chat-id')
+        VPS_HOST           = 'vps-lokal.internal.mapid.io'
+    }
+
+    stages {
+        stage('Validate Git Tag') {
+            steps {
+                script {
+                    // Memastikan build berjalan jika ada Tag Git yang sesuai format
+                    echo "Building for Tag: ${env.TAG_NAME}"
+                }
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
+            }
+        }
+
+        stage('Security Vulnerability Scan (Trivy)') {
+            steps {
+                // Memindai image dari kerentanan High & Critical menggunakan Trivy
+                sh """
+                    trivy image --exit-code 1 --severity HIGH,CRITICAL ${IMAGE_NAME}:${BUILD_NUMBER}
+                """
+            }
+        }
+
+        stage('Push to AWS ECR') {
+            steps {
+                withCredentials([aws(credentialsId: 'aws-ecr-credentials', region: "${env.AWS_REGION}")]) {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${ECR_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${ECR_REGISTRY}/${IMAGE_NAME}:latest
+                        docker push ${ECR_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker push ${ECR_REGISTRY}/${IMAGE_NAME}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Local VPS') {
+            steps {
+                sshagent(credentials: ['vps-local-ssh-key']) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no user@${VPS_HOST} "\
+                            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY} && \
+                            cd /opt/mapid/retail-platform && \
+                            docker compose pull && \
+                            docker compose up -d --remove-orphans"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                sh """
+                    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                    -d "text=SUCCESS: Deployment Hybrid MAPID (${IMAGE_NAME}:${BUILD_NUMBER}) berhasil dijalankan!"
+                """
+            }
+        }
+        failure {
+            script {
+                sh """
+                    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                    -d "text=FAILED: Deployment Hybrid MAPID (${IMAGE_NAME}:${BUILD_NUMBER}) gagal! Mohon cek console Jenkins."
+                """
+            }
+        }
+    }
+}
