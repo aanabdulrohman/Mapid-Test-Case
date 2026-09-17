@@ -1,0 +1,92 @@
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY_URL       = 'registry.internal.mapid.io'
+        IMAGE_NAME         = 'mapid-retail-platform'
+        
+        // Memanggil Environment Variables & File Config (.env) aman dari Jenkins Credentials
+        TELEGRAM_BOT_TOKEN = credentials('telegram-bot-token')
+        TELEGRAM_CHAT_ID   = credentials('telegram-chat-id')
+        VPS_HOST           = 'vps-lokal.internal.mapid.io'
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Load Environment File') {
+            steps {
+                // Mengambil file konfigurasi .env yang disimpan aman di Jenkins Credentials (Secret File)
+                withCredentials([file(credentialsId: 'production-env-file', variable: 'ENV_FILE')]) {
+                    sh 'cp $ENV_FILE .env'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
+            }
+        }
+
+        stage('Security Vulnerability Scan (Trivy)') {
+            steps {
+                sh """
+                    trivy image --exit-code 1 --severity HIGH,CRITICAL ${IMAGE_NAME}:${BUILD_NUMBER}
+                """
+            }
+        }
+
+        stage('Push to Private Registry') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'private-registry-credentials', usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+                    sh """
+                        echo "${REG_PASS}" | docker login ${REGISTRY_URL} -u "${REG_USER}" --password-stdin
+                        docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${REGISTRY_URL}/${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${REGISTRY_URL}/${IMAGE_NAME}:latest
+                        docker push ${REGISTRY_URL}/${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker push ${REGISTRY_URL}/${IMAGE_NAME}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Local VPS') {
+            steps {
+                sshagent(credentials: ['vps-local-ssh-key']) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no user@${VPS_HOST} "\
+                            cd /opt/mapid/retail-platform && \
+                            docker compose pull && \
+                            docker compose up -d --remove-orphans"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                sh """
+                    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                    -d "text=SUCCESS: Deployment Self-Hosted MAPID (${IMAGE_NAME}:${BUILD_NUMBER}) berhasil!"
+                """
+            }
+        }
+        failure {
+            script {
+                sh """
+                    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                    -d "text=FAILED: Deployment Self-Hosted MAPID (${IMAGE_NAME}:${BUILD_NUMBER}) gagal!"
+                """
+            }
+        }
+    }
+}
